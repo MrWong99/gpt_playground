@@ -84,17 +84,24 @@ func main() {
 		},
 	}
 	allWords := make([]Word, 0)
-	for _, req := range requests {
-		gcsUri, err := uploadFileToGCS(bucketName, "audio-files/"+filepath.Base(req.Filename), req.Filename)
-		if err != nil {
-			slog.Error("could not upload file to GCS", "file", req.Filename, "error", err)
-			os.Exit(1)
-		}
-		words, err := transcribeFile(gcsUri, req.Nickname)
-		if err != nil {
-			slog.Error("could not transcribe file", "file", req.Filename, "error", err)
-		}
-		allWords = append(allWords, words...)
+	transcriptionChan := make(chan []Word, len(requests))
+	for _, r := range requests {
+		defer func(req UserTranscription) {
+			gcsUri, err := uploadFileToGCS(bucketName, "audio-files/"+filepath.Base(req.Filename), req.Filename)
+			if err != nil {
+				slog.Error("could not upload file to GCS", "file", req.Filename, "error", err)
+				transcriptionChan <- make([]Word, 0)
+			}
+			words, err := transcribeFile(gcsUri, req.Nickname)
+			if err != nil {
+				slog.Error("could not transcribe file", "file", req.Filename, "error", err)
+				transcriptionChan <- make([]Word, 0)
+			}
+			transcriptionChan <- words
+		}(r)
+	}
+	for i := 0; i < len(requests); i++ {
+		allWords = append(allWords, <-transcriptionChan...)
 	}
 	slices.SortFunc(allWords, func(a, b Word) int {
 		if a.StartTime < b.StartTime {
@@ -114,6 +121,9 @@ func main() {
 		fullConversation = fmt.Sprintf("%s\n%s", fullConversation, line.String())
 	}
 	fmt.Printf("This is the full conversation:\n\n%s\n", fullConversation)
+	if err := os.WriteFile("transcription.txt", []byte(fullConversation), 0600); err != nil {
+		slog.Warn("could not store transcription", "error", err)
+	}
 	fmt.Println("\n\nTrying summary now...")
 	summary, err := summarize(fullConversation)
 	if err != nil {
@@ -121,6 +131,9 @@ func main() {
 		os.Exit(1)
 	}
 	fmt.Printf("This is the summary:\n\n%s\n", summary)
+	if err := os.WriteFile("summary.txt", []byte(fullConversation), 0600); err != nil {
+		slog.Warn("could not store summary", "error", err)
+	}
 }
 
 func transcribeFile(gcsUri, nickname string) ([]Word, error) {
@@ -255,6 +268,9 @@ func summarize(conversation string) (string, error) {
 	messages, err := client.ListMessage(ctx, resp.ThreadID, nil, nil, nil, nil)
 	if err != nil {
 		return "", err
+	}
+	if delResp, err := client.DeleteThread(ctx, resp.ThreadID); err != nil || !delResp.Deleted {
+		slog.Warn("could not delete thread after finish", "threadID", resp.ThreadID, "response", delResp, "error", err)
 	}
 	return messages.Messages[0].Content[0].Text.Value, nil
 }

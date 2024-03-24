@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	_ "embed"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -13,10 +14,11 @@ import (
 	"strings"
 	"time"
 
-	speech "cloud.google.com/go/speech/apiv1"
-	"cloud.google.com/go/speech/apiv1/speechpb"
+	speech "cloud.google.com/go/speech/apiv2"
+	"cloud.google.com/go/speech/apiv2/speechpb"
 	"cloud.google.com/go/storage"
 	"github.com/sashabaranov/go-openai"
+	"google.golang.org/api/option"
 )
 
 type UserTranscription struct {
@@ -62,6 +64,9 @@ func (w *Word) String() string {
 //go:embed bucketname
 var bucketName string
 
+//go:embed recognizer
+var recognizer string
+
 //go:embed openai.token
 var openAiToken string
 
@@ -78,27 +83,34 @@ func main() {
 			Nickname: "GameMaster",
 			Filename: "input/user2.flac",
 		},
-		{
-			Nickname: "Adventurer2",
-			Filename: "input/user3.flac",
-		},
 	}
 	allWords := make([]Word, 0)
 	transcriptionChan := make(chan []Word, len(requests))
 	for _, r := range requests {
-		defer func(req UserTranscription) {
-			gcsUri, err := uploadFileToGCS(bucketName, "audio-files/"+filepath.Base(req.Filename), req.Filename)
+		go func(req UserTranscription, c chan<- []Word) {
+			gcsUri, err := uploadFileToGCS(bucketName, "audio-files/"+req.Nickname+filepath.Ext(req.Filename), req.Filename)
 			if err != nil {
 				slog.Error("could not upload file to GCS", "file", req.Filename, "error", err)
-				transcriptionChan <- make([]Word, 0)
+				c <- make([]Word, 0)
+				return
 			}
-			words, err := transcribeFile(gcsUri, req.Nickname)
+			words, err := transcribeFileGc(gcsUri, req.Nickname)
 			if err != nil {
 				slog.Error("could not transcribe file", "file", req.Filename, "error", err)
-				transcriptionChan <- make([]Word, 0)
+				c <- make([]Word, 0)
+				return
 			}
-			transcriptionChan <- words
-		}(r)
+			c <- words
+			/*
+				words, err := transcribeFileOpenAI(req.Filename, req.Nickname)
+				if err != nil {
+					slog.Error("could not transcribe file", "file", req.Filename, "error", err)
+					c <- make([]Word, 0)
+					return
+				}
+				c <- words
+			*/
+		}(r, transcriptionChan)
 	}
 	for i := 0; i < len(requests); i++ {
 		allWords = append(allWords, <-transcriptionChan...)
@@ -124,55 +136,167 @@ func main() {
 	if err := os.WriteFile("transcription.txt", []byte(fullConversation), 0600); err != nil {
 		slog.Warn("could not store transcription", "error", err)
 	}
+	if len(fullConversation) == 0 {
+		slog.Error("No coversation detected, nothing to summarize...")
+		os.Exit(1)
+	}
 	fmt.Println("\n\nTrying summary now...")
-	summary, err := summarize(fullConversation)
+	summary, err := summarize(lines)
 	if err != nil {
 		slog.Error("could not create summary", "error", err)
 		os.Exit(1)
 	}
 	fmt.Printf("This is the summary:\n\n%s\n", summary)
-	if err := os.WriteFile("summary.txt", []byte(fullConversation), 0600); err != nil {
+	if err := os.WriteFile("summary.txt", []byte(summary), 0600); err != nil {
 		slog.Warn("could not store summary", "error", err)
 	}
 }
 
-func transcribeFile(gcsUri, nickname string) ([]Word, error) {
+/*
+func transcribeFileOpenAI(file, nickname string) ([]Word, error) {
+	client := openai.NewClient(openAiToken)
+	resp, err := client.CreateTranscription(context.Background(), openai.AudioRequest{
+		Model:                  "whisper-1",
+		FilePath:               file,
+		Format:                 openai.AudioResponseFormatVerboseJSON,
+		TimestampGranularities: []string{"word"},
+	})
+	if err != nil {
+		return nil, err
+	}
+	words := make([]Word, 0)
+	for _, segment := range resp.Segments {
+		currentTimestamp := segment.Start
+		wordSplit := strings.Split(segment.Text, " ")
+		stepSize := (segment.End - segment.Start) / float64(len(wordSplit))
+		for _, word := range wordSplit {
+			words = append(words, Word{
+				Nickname:  nickname,
+				Text:      word,
+				StartTime: time.Duration(currentTimestamp),
+			})
+			currentTimestamp += stepSize
+		}
+	}
+	return words, nil
+}
+*/
+
+func transcribeFileGc(gcsUri, nickname string) ([]Word, error) {
 	ctx := context.Background()
-	client, err := speech.NewClient(ctx)
+	client, err := speech.NewClient(ctx, option.WithEndpoint("europe-west3-speech.googleapis.com:443"))
 	if err != nil {
 		return nil, errors.Join(err, errors.New("failed to create client"))
 	}
 	defer client.Close()
-
-	recognitionProcess, err := client.LongRunningRecognize(ctx, &speechpb.LongRunningRecognizeRequest{
-		Config: &speechpb.RecognitionConfig{
-			Model:                               "latest_long",
-			LanguageCode:                        "de-DE",
-			EnableAutomaticPunctuation:          true,
-			EnableWordTimeOffsets:               true,
-			EnableSeparateRecognitionPerChannel: false,
-			AudioChannelCount:                   2,
+	rec, err := client.GetRecognizer(ctx, &speechpb.GetRecognizerRequest{
+		Name: recognizer,
+	})
+	if err != nil {
+		return nil, errors.Join(err, errors.New("failed to get regonizer"))
+	}
+	op, err := client.BatchRecognize(ctx, &speechpb.BatchRecognizeRequest{
+		Recognizer: recognizer,
+		Config:     rec.DefaultRecognitionConfig,
+		RecognitionOutputConfig: &speechpb.RecognitionOutputConfig{
+			Output: &speechpb.RecognitionOutputConfig_GcsOutputConfig{
+				GcsOutputConfig: &speechpb.GcsOutputConfig{
+					Uri: strings.TrimSuffix(gcsUri, filepath.Ext(gcsUri)) + ".json",
+				},
+			},
 		},
-		Audio: &speechpb.RecognitionAudio{
-			AudioSource: &speechpb.RecognitionAudio_Uri{Uri: gcsUri},
+		Files: []*speechpb.BatchRecognizeFileMetadata{
+			{
+				AudioSource: &speechpb.BatchRecognizeFileMetadata_Uri{
+					Uri: gcsUri,
+				},
+			},
 		},
 	})
 	if err != nil {
-		return nil, errors.Join(err, errors.New("failed to start long running recognition"))
+		return nil, errors.Join(err, errors.New("could not start batch recognition"))
 	}
 
-	resp, err := recognitionProcess.Wait(ctx)
+	resp, err := op.Wait(ctx)
 	if err != nil {
 		return nil, errors.Join(err, errors.New("failed to recognize"))
 	}
 
 	words := make([]Word, 0)
+	storageClient, err := storage.NewClient(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer storageClient.Close()
 	for _, result := range resp.Results {
-		for _, word := range result.Alternatives[0].Words {
-			words = append(words, Word{Nickname: nickname, StartTime: word.StartTime.AsDuration(), Text: word.Word})
+		if result.Error != nil {
+			return nil, fmt.Errorf("could not transcribe. %s - status %d details %v", result.Error.Message, result.Error.Code, result.Error.Details)
+		}
+		obj := storageClient.Bucket(bucketName).Object(strings.TrimPrefix(result.GetCloudStorageResult().Uri, "gs://"+bucketName+"/"))
+		reader, err := obj.NewReader(ctx)
+		if err != nil {
+			return nil, err
+		}
+		defer reader.Close()
+
+		var recognition StoredRecognitionResult
+		if err := json.NewDecoder(reader).Decode(&recognition); err != nil {
+			return nil, errors.Join(errors.New("could not parse recognition result"), err)
+		}
+		for _, r := range recognition.Results {
+			for _, word := range r.Alternatives[0].Words {
+				words = append(words, Word{
+					Nickname:  nickname,
+					Text:      word.Word,
+					StartTime: time.Duration(word.StartOffset),
+				})
+			}
 		}
 	}
 	return words, nil
+}
+
+type Duration time.Duration
+
+func (d Duration) MarshalJSON() ([]byte, error) {
+	return json.Marshal(time.Duration(d).String())
+}
+
+func (d *Duration) UnmarshalJSON(b []byte) error {
+	var v interface{}
+	if err := json.Unmarshal(b, &v); err != nil {
+		return err
+	}
+	switch value := v.(type) {
+	case float64:
+		*d = Duration(time.Duration(value))
+		return nil
+	case string:
+		tmp, err := time.ParseDuration(value)
+		if err != nil {
+			return err
+		}
+		*d = Duration(tmp)
+		return nil
+	default:
+		return errors.New("invalid duration")
+	}
+}
+
+type StoredRecognitionResult struct {
+	Results []struct {
+		Alternatives []struct {
+			Transcript string  `json:"transcript"`
+			Confidence float64 `json:"confidence"`
+			Words      []struct {
+				Word        string   `json:"word"`
+				StartOffset Duration `json:"startOffset"`
+				EndOffset   Duration `json:"endOffset"`
+			} `json:"words"`
+		} `json:"alternatives"`
+		ResultEndOffset Duration `json:"resultEndOffset"`
+		LanguageCode    string   `json:"languageCode"`
+	} `json:"results"`
 }
 
 func uploadFileToGCS(bucketName, fileName, filePath string) (gcsUri string, err error) {
@@ -220,6 +344,11 @@ func constructLines(words []Word) []Line {
 		if i == 0 {
 			continue
 		}
+		if currentWord.Text == lastWord.Text && currentWord.StartTime == lastWord.StartTime {
+			// Protect from word doubling.
+			// Don't ask me why this happens. The issue is most certainly somewhere else but I was too lazy to find it...
+			continue
+		}
 		if lastWord.Nickname == currentWord.Nickname && (currentWord.StartTime-lastWord.StartTime) < 7*time.Second {
 			// Word is in streak
 			continousWords = append(continousWords, currentWord)
@@ -243,15 +372,32 @@ func asLine(words []Word) Line {
 	}
 }
 
-func summarize(conversation string) (string, error) {
+func summarize(lines []Line) (string, error) {
 	client := openai.NewClient(openAiToken)
 	ctx := context.Background()
+	linesPerRequest := make([]string, 0)
+	currentText := ""
+	tokenCount := float32(0)
+	for _, line := range lines {
+		lineTokens := float32(len(line.Words))*1.5 + 4 // rough and conservative estimation. See https://help.openai.com/en/articles/4936856-what-are-tokens-and-how-to-count-them
+		newTotal := tokenCount + lineTokens
+		if newTotal > 122000 { // GPT-4-turbo has a limit of 128.000 tokens. Adjust this for any other model
+			currentText += "\nNEXT CHUNK AFTER RESPONSE"
+			linesPerRequest = append(linesPerRequest, currentText)
+			currentText = line.String()
+			tokenCount = lineTokens
+		} else {
+			currentText += "\n" + line.String()
+			tokenCount = newTotal
+		}
+	}
+	linesPerRequest = append(linesPerRequest, currentText)
 	resp, err := client.CreateThreadAndRun(ctx, openai.CreateThreadAndRunRequest{
 		Thread: openai.ThreadRequest{
 			Messages: []openai.ThreadMessage{
 				{
 					Role:    "user",
-					Content: conversation,
+					Content: linesPerRequest[0],
 				},
 			},
 		},
@@ -262,7 +408,24 @@ func summarize(conversation string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	if err := waitForRun(ctx, client, resp.ThreadID, resp.ID); err != nil {
+	runID := resp.ID
+	for i, text := range linesPerRequest {
+		if i == 0 {
+			continue
+		}
+		if err := waitForRun(ctx, client, resp.ThreadID, runID); err != nil {
+			return "", err
+		}
+		msg, err := client.CreateMessage(ctx, resp.ThreadID, openai.MessageRequest{
+			Role:    "user",
+			Content: text,
+		})
+		if err != nil {
+			return "", err
+		}
+		runID = *msg.RunID
+	}
+	if err := waitForRun(ctx, client, resp.ThreadID, runID); err != nil {
 		return "", err
 	}
 	messages, err := client.ListMessage(ctx, resp.ThreadID, nil, nil, nil, nil)

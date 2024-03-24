@@ -2,3 +2,7 @@ gc-signin.json
 bucketname
 openai.token
 assistant.id
+*.flac
+recognizer
+summary.txt
+transcription.txt

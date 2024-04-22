@@ -6,3 +6,4 @@ assistant.id
 recognizer
 summary.txt
 transcription.txt
+output/

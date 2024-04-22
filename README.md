@@ -1,13 +1,23 @@
 # Quick and dirty audio transcriptions and summary
 
-This utilizes Google Cloud speech-to-text and OpenAI GPT-4 to create summaries for audio conversations.
+This utilizes ~~Google Cloud~~ [WhisperX](https://github.com/m-bain/whisperX) speech-to-text and OpenAI GPT-4 to create summaries for audio conversations.
 Conversations can be provided from Discord via CraigBot.
 Make sure to set required configs:
 
 * __assistant.id__ `file` -> contains OpenAI assistant ID to send transcription to
-* __bucketname__ `file` -> contains name of the Google Cloud storage bucket to store transcriptions in
 * __openai.token__ `file` -> contains OpenAI API token for signing in
-* __GOOGLE_APPLICATION_CREDENTIALS__ `env` -> path to a Google Cloud API sign in file
+
+## Setup WhisperX
+
+This is what I did for my unix system with Nvidia and Intel:
+
+```
+yay -S ffmpeg python-tiktoken cuda cuda-tools cudnn miniconda3 intel-oneapi-mkl
+conda create --name whisperx python=3.10
+conda activate whisperx
+conda install pytorch==2.2.0 torchvision==0.17.0 torchaudio==2.2.0 pytorch-cuda=12.1 -c pytorch -c nvidia
+pip install git+https://github.com/m-bain/whisperx.git
+```
 
 ## OpenAI assistant
 
